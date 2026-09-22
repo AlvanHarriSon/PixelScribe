@@ -1,9 +1,8 @@
 import base64
 import os
 import tempfile
-import json
+import io
 from openai import OpenAI
-import PyPDF2
 from pdf2image import convert_from_path
 from PIL import Image, ImageTk
 import logging
@@ -13,7 +12,6 @@ from tkinter import filedialog, ttk, messagebox
 import customtkinter as ctk
 import threading
 import queue
-import time
 from datetime import datetime
 import csv
 
@@ -55,11 +53,12 @@ class FileDescriptor:
             fmt = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
             fh.setFormatter(fmt)
             self.logger.addHandler(fh)
-        except Exception:
-            pass
+        except OSError:
+            self.logger.warning("Unable to open log file", exc_info=True)
 
         # 创建 GUI
         self.create_gui()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def create_gui(self):
         # 初始化外观与窗口
@@ -88,7 +87,7 @@ class FileDescriptor:
 
         # 主题切换
         def _toggle_theme():
-            mode = "dark" if ctk.get_appearance_mode() == "light" else "light"
+            mode = "dark" if ctk.get_appearance_mode().lower() == "light" else "light"
             ctk.set_appearance_mode(mode)
 
         ctk.CTkButton(toolbar, text="切换主题", width=90, command=_toggle_theme).pack(side="right", padx=6)
@@ -434,9 +433,9 @@ class FileDescriptor:
                     val = tv.set(k, col)
                     try:
                         dt = datetime.fromisoformat(val)
-                        l.append((dt, k))
+                        l.append(((1, dt.isoformat()), k))
                     except Exception:
-                        l.append((val, k))
+                        l.append(((0, str(val)), k))
             l.sort(reverse=reverse)
             # 重新排列
             for index, (val, k) in enumerate(l):
@@ -471,6 +470,10 @@ class FileDescriptor:
             self.logger.error(tb)
         except Exception:
             pass
+        # Tk calls must remain on the main thread, including failure dialogs.
+        if threading.current_thread() is not threading.main_thread():
+            self.queue.put(('error', f'{type(exc).__name__}: {exc}'))
+            return
         # 弹出错误对话并提供查看与导出选项
         try:
             # 使用自定义对话显示更多信息
@@ -495,117 +498,97 @@ class FileDescriptor:
         except Exception:
             pass
 
-    def _worker(self, files, prompt, model, max_pages):
-        """后台线程执行文件处理并通过队列发送更新"""
-        try:
-            total = len(files) if files else 1
-            for idx, file_path in enumerate(files):
-                if self.cancel_event.is_set():
-                    self.queue.put(('status', '任务已取消'))
-                    break
-                file_ext = os.path.splitext(file_path)[1].lower()
-                file_name = os.path.basename(file_path)
-                self.queue.put(('status', f"正在处理 {file_name} ({idx+1}/{total})"))
-
-                if file_ext in self.supported_image_types:
-                    base64_image = self.encode_image(file_path)
-                    if not base64_image:
-                        self.queue.put(('error', f"图片编码失败: {file_name}"))
-                        continue
-
-                    # 请求重试机制
-                    attempt = 0
-                    while attempt < 4:
-                        try:
-                            response = self.client.chat.completions.create(
-                                model=model,
-                                messages=[
-                                    {"role": "system", "content": [{"type": "text", "text": "你是一个专业的内容描述助手，擅长详细描述图片和文档内容。"}]},
-                                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}, {"type": "text", "text": prompt}]}
-                                ]
-                            )
-                            description = getattr(response.choices[0].message, 'content', None) or response.choices[0].message.content
-                            self.queue.put(('append_result', f"=== {file_name} 的描述 ===\n{description}"))
-                            # add history
-                            hist = {'ts': datetime.now().isoformat(), 'snippet': (description.splitlines()[0][:60] if description else file_name), 'path': file_path}
-                            self.queue.put(('history_add', hist))
-                            break
-                        except Exception as e:
-                            self._record_exception(e)
-                            s = str(e).lower()
-                            if 'rate' in s or '429' in s:
-                                backoff = (2 ** attempt)
-                                self.queue.put(('status', f"被限流，{backoff}s 后重试... (尝试 {attempt+1})"))
-                                time.sleep(backoff)
-                                attempt += 1
-                                continue
-                            else:
-                                self.queue.put(('error', f"处理 {file_name} 时出错: {e}"))
-                                break
-
-                elif file_ext in self.supported_pdf_types:
-                    image_paths = self.pdf_to_images(file_path)
-                    if not image_paths:
-                        self.queue.put(('append_result', f"=== {file_name} 无法处理PDF ==="))
-                        continue
-
-                    for i, img_path in enumerate(image_paths):
-                        base64_image = self.encode_image(img_path)
-                        if not base64_image:
-                            continue
-
-                        attempt = 0
-                        while attempt < 4:
-                            try:
-                                response = self.client.chat.completions.create(
-                                    model=model,
-                                    messages=[
-                                        {"role": "system", "content": [{"type": "text", "text": "你是一个专业的内容描述助手，擅长详细描述图片和文档内容。"}]},
-                                        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}, {"type": "text", "text": f"{prompt} 这是PDF的第 {i+1} 页。"}]}
-                                    ]
-                                )
-                                description = getattr(response.choices[0].message, 'content', None) or response.choices[0].message.content
-                                self.queue.put(('append_result', f"--- 第 {i+1} 页 ---\n{description}"))
-                                # partial progress
-                                self.queue.put(('progress', 0.3 + (i+1)/len(image_paths)*0.6))
-                                break
-                            except Exception as e:
-                                self._record_exception(e)
-                                s = str(e).lower()
-                                if 'rate' in s or '429' in s:
-                                    backoff = (2 ** attempt)
-                                    self.queue.put(('status', f"被限流，{backoff}s 后重试... (尝试 {attempt+1})"))
-                                    time.sleep(backoff)
-                                    attempt += 1
-                                    continue
-                                else:
-                                    self.queue.put(('error', f"处理 {file_name} 时出错: {e}"))
-                                    break
-
-                    # 清理临时文件
-                    for img_path in image_paths:
-                        if os.path.exists(img_path):
-                            try:
-                                os.remove(img_path)
-                            except:
-                                pass
-
-                # file loop end
-                self.queue.put(('progress', (idx+1)/total))
-
-            self.queue.put(('status', '描述生成完成'))
-        except Exception as e:
-            self.queue.put(('error', f'后台处理失败: {e}'))
-        finally:
+    def _describe_image(self, image_path, prompt, model):
+        encoded = self.encode_image(image_path)
+        if not encoded:
+            raise ValueError("图片编码失败")
+        for attempt in range(4):
+            if self.cancel_event.is_set():
+                return None
             try:
-                # 尝试清理取消标志，保证下一次可用
-                self.cancel_event.clear()
-            except Exception:
-                pass
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "你是一个专业的内容描述助手，擅长详细描述图片和文档内容。"},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                            {"type": "text", "text": prompt},
+                        ]},
+                    ],
+                )
+                if self.cancel_event.is_set():
+                    return None
+                description = response.choices[0].message.content
+                if not isinstance(description, str) or not description.strip():
+                    raise ValueError("模型未返回描述文本")
+                return description
+            except Exception as exc:
+                if getattr(exc, 'status_code', None) != 429 or attempt == 3:
+                    raise
+                delay = 2 ** attempt
+                self.queue.put(('status', f'被限流，{delay}s 后重试...'))
+                if self.cancel_event.wait(delay):
+                    return None
+        return None
+
+    def _worker(self, files, prompt, model, max_pages):
+        """Keep network/file work off Tk; every UI update goes through the queue."""
+        failed = 0
+        try:
+            for index, file_path in enumerate(files):
+                if self.cancel_event.is_set():
+                    break
+                image_paths = []
+                file_name = os.path.basename(file_path)
+                self.queue.put(('status', f'正在处理 {file_name} ({index + 1}/{len(files)})'))
+                try:
+                    extension = os.path.splitext(file_path)[1].lower()
+                    if extension in self.supported_pdf_types:
+                        image_paths = self.pdf_to_images(file_path, max_pages)
+                        if not image_paths:
+                            raise ValueError('PDF 未生成可处理的页面')
+                        inputs = image_paths
+                    elif extension in self.supported_image_types:
+                        inputs = [file_path]
+                    else:
+                        raise ValueError(f'不支持的文件类型: {extension}')
+                    for page, image_path in enumerate(inputs, 1):
+                        if self.cancel_event.is_set():
+                            break
+                        request_prompt = f'{prompt} 这是PDF的第 {page} 页。' if image_paths else prompt
+                        description = self._describe_image(image_path, request_prompt, model)
+                        if description is None:
+                            break
+                        heading = f'=== {file_name} 第 {page} 页 ===' if image_paths else f'=== {file_name} 的描述 ==='
+                        self.queue.put(('append_result', heading + '\n' + description))
+                        self.queue.put(('history_add', {
+                            'ts': datetime.now().isoformat(), 'snippet': description.splitlines()[0][:60], 'path': file_path,
+                        }))
+                        self.queue.put(('progress', (index + page / len(inputs)) / len(files)))
+                except Exception as exc:
+                    failed += 1
+                    self._record_exception(exc)
+                finally:
+                    for image_path in image_paths:
+                        try:
+                            os.remove(image_path)
+                        except OSError:
+                            self.logger.warning('Temporary image cleanup failed', exc_info=True)
+            if self.cancel_event.is_set():
+                status = '任务已取消'
+            elif failed:
+                status = f'处理结束，{failed} 个文件失败'
+            else:
+                status = '描述生成完成'
+            self.queue.put(('status', status))
+        finally:
             self.queue.put(('done', None))
 
     def generate_description(self):
         """启动后台线程生成文件内容描述（非阻塞 UI）"""
+        if self.is_processing or (self.worker_thread and self.worker_thread.is_alive()):
+            self.status_var.set("任务正在处理中")
+            return
         if not self.file_list:
             messagebox.showwarning("警告", "请先选择文件")
             return
@@ -618,7 +601,13 @@ class FileDescriptor:
 
         prompt = self.prompt_text.get(1.0, tk.END).strip()
         model = self.model_var.get()
-        max_pages = int(self.max_pages_var.get()) if self.max_pages_var.get().isdigit() else 5
+        try:
+            max_pages = int(self.max_pages_var.get())
+            if max_pages < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("警告", "PDF 页数必须是正整数")
+            return
 
         # 清理旧结果
         self.result_text.delete(1.0, tk.END)
@@ -641,9 +630,9 @@ class FileDescriptor:
         """浏览单个文件"""
         file_path = filedialog.askopenfilename(
             filetypes=[
-                ("支持的文件", f"*{''.join(self.supported_image_types + self.supported_pdf_types)}"),
-                ("图片文件", f"*{''.join(self.supported_image_types)}"),
-                ("PDF文件", f"*{''.join(self.supported_pdf_types)}"),
+                ("支持的文件", " ".join("*" + ext for ext in self.supported_image_types + self.supported_pdf_types)),
+                ("图片文件", " ".join("*" + ext for ext in self.supported_image_types)),
+                ("PDF文件", "*.pdf"),
                 ("所有文件", "*.*")
             ]
         )
@@ -657,9 +646,9 @@ class FileDescriptor:
         """浏览多个文件"""
         file_paths = filedialog.askopenfilenames(
             filetypes=[
-                ("支持的文件", f"*{''.join(self.supported_image_types + self.supported_pdf_types)}"),
-                ("图片文件", f"*{''.join(self.supported_image_types)}"),
-                ("PDF文件", f"*{''.join(self.supported_pdf_types)}"),
+                ("支持的文件", " ".join("*" + ext for ext in self.supported_image_types + self.supported_pdf_types)),
+                ("图片文件", " ".join("*" + ext for ext in self.supported_image_types)),
+                ("PDF文件", "*.pdf"),
                 ("所有文件", "*.*")
             ]
         )
@@ -671,54 +660,52 @@ class FileDescriptor:
                 self.show_preview(self.file_list[0])
 
     def encode_image(self, image_path):
-        """将图片编码为base64"""
-        try:
-            with open(image_path, "rb") as image_file:
-                return base64.b64encode(image_file.read()).decode('utf-8')
-        except Exception as e:
-            self.status_var.set(f"图片编码错误: {str(e)}")
-            return None
+        """Normalize supported formats to PNG so payload bytes match their MIME type."""
+        with Image.open(image_path) as source:
+            with source.convert('RGB') as rgb, io.BytesIO() as buffer:
+                rgb.save(buffer, format='PNG')
+                return base64.b64encode(buffer.getvalue()).decode('ascii')
 
-    def pdf_to_images(self, pdf_path):
-        """将PDF转换为图片（使用pdf2image库完善实现）"""
+    def pdf_to_images(self, pdf_path, max_pages=None):
+        # Compatibility: direct UI callers may omit the page limit. Workers pass a snapshot.
+        if max_pages is None:
+            max_pages = int(self.max_pages_var.get())
+        if max_pages < 1:
+            raise ValueError('PDF 页数必须是正整数')
         images = []
+        pages = convert_from_path(pdf_path, dpi=300, first_page=1,
+                                  last_page=max_pages, fmt='png', timeout=60)
         try:
-            # 获取用户设置的最大页数
-            max_pages = int(self.max_pages_var.get()) if self.max_pages_var.get().isdigit() else 5
-
-            # 转换PDF为图片（分辨率300dpi）
-            # 注：需要确保poppler已安装并添加到系统环境变量
-            pages = convert_from_path(
-                pdf_path,
-                dpi=300,
-                first_page=1,
-                last_page=max_pages,
-                fmt='png',
-                output_folder=None
-            )
-
-            self.status_var.set(f"正在处理PDF，共 {len(pages)} 页")
-
-            for i, page in enumerate(pages):
-                # 创建临时文件保存PDF页面图片
+            for page in pages:
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                    page.save(temp_file, 'PNG')
                     images.append(temp_file.name)
-
+                    page.save(temp_file, 'PNG')
             return images
-        except Exception as e:
-            self.status_var.set(f"PDF处理错误: {str(e)}")
-            messagebox.showerror("PDF处理错误", f"处理PDF时出错：{str(e)}\n请确保已安装poppler并配置环境变量")
-            return []
+        except Exception:
+            for image_path in images:
+                try:
+                    os.remove(image_path)
+                except OSError:
+                    self.logger.warning('Temporary image cleanup failed', exc_info=True)
+            raise
+        finally:
+            for page in pages:
+                page.close()
 
     def apply_api_key(self):
         """使用界面输入的 API Key 初始化 OpenAI 客户端"""
+        if self.is_processing:
+            self.status_var.set("请等待当前任务结束后更换 Key")
+            return
         key = self.api_key_var.get().strip()
         if not key:
             messagebox.showwarning("警告", "请输入 API Key 后再应用")
             return
         try:
-            self.client = OpenAI(api_key=key, base_url=self.openai_base_url)
+            client = OpenAI(api_key=key, base_url=self.openai_base_url, timeout=60.0, max_retries=0)
+            if self.client is not None:
+                self.client.close()
+            self.client = client
             self.status_var.set("API Key 已应用")
         except Exception as e:
             messagebox.showerror("错误", f"初始化 OpenAI 客户端失败：{e}")
@@ -743,14 +730,17 @@ class FileDescriptor:
                 self.preview_label.configure(text="(不支持预览)")
                 return
 
-            img.thumbnail((420, 300))
-            self._preview_photo = ImageTk.PhotoImage(img)
+            try:
+                img.thumbnail((420, 300))
+                self._preview_photo = ImageTk.PhotoImage(img)
+            finally:
+                img.close()
             self.preview_label.configure(image=self._preview_photo, text="")
         except Exception as e:
             self.preview_label.configure(text="(预览失败)")
             self.status_var.set(f"预览错误: {e}")
 
-    
+
 
     def export_history(self):
         """导出历史为 CSV 文件（包含时间戳、摘要、路径）"""
@@ -775,6 +765,7 @@ class FileDescriptor:
     def clear_history(self):
         """清空历史列表"""
         self.history.clear()
+        self._history_iid_map.clear()
         try:
             # 清空 treeview
             for iid in self.history_tree.get_children():
@@ -802,12 +793,8 @@ class FileDescriptor:
                 messagebox.showinfo("成功", f"结果已保存至: {save_path}")
                 # 更新历史（字典格式）
                 short = self.current_result.strip().splitlines()[0][:60]
-                hist = {'ts': datetime.now().isoformat(), 'snippet': short, 'path': ''}
-                self.history.insert(0, hist)
-                try:
-                    self.history_tree.insert('', 0, values=(hist.get('ts',''), hist.get('snippet',''), hist.get('path','')))
-                except Exception:
-                    pass
+                hist = {'ts': datetime.now().isoformat(), 'snippet': short, 'path': save_path}
+                self._insert_history(hist)
             except Exception as e:
                 self.status_var.set(f"保存失败: {str(e)}")
                 messagebox.showerror("保存失败", f"保存文件时出错：{str(e)}")
@@ -832,7 +819,18 @@ class FileDescriptor:
         self._preview_photo = None
         self.status_var.set("已清除选择")
 
-    
+
+
+    def close(self):
+        """Finish cleanup before closing the client; never block Tk with join()."""
+        self.cancel_event.set()
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.status_var.set('正在取消任务并关闭...')
+            self.root.after(100, self.close)
+            return
+        if self.client is not None:
+            self.client.close()
+        self.root.destroy()
 
     def run(self):
         """运行程序"""

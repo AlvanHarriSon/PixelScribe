@@ -1,0 +1,4 @@
+openai>=1.0
+pdf2image>=1.16
+Pillow>=10.0
+customtkinter>=5.2
